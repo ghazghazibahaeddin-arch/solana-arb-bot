@@ -1,8 +1,23 @@
+"""
+Ghost Engine Scanner
+
+Source:
+DexScreener API
+
+وظيفته:
+- جلب أزواج Solana الحية
+- تحديث البيانات كل عدة ثواني
+"""
+
 import requests
 import time
 
 
-DEX_URL = "https://api.dexscreener.com/latest/dex/search?q=SOL"
+DEXSCREENER_URL = (
+    "https://api.dexscreener.com/"
+    "latest/dex/search?q=SOL"
+)
+
 
 
 def fetch_pairs():
@@ -10,41 +25,92 @@ def fetch_pairs():
     try:
 
         response = requests.get(
-            DEX_URL,
+            DEXSCREENER_URL,
             timeout=10
         )
 
+
+        response.raise_for_status()
+
+
         data = response.json()
 
-        return data.get("pairs", [])
+
+        pairs = data.get(
+            "pairs",
+            []
+        )
+
+
+        # فقط Solana
+
+        sol_pairs = [
+
+            pair
+
+            for pair in pairs
+
+            if pair.get(
+                "chainId"
+            ) == "solana"
+
+        ]
+
+
+        return sol_pairs
+
 
 
     except Exception as e:
 
-        print("Scanner error:", e)
+
+        print(
+            "Scanner error:",
+            e
+        )
+
 
         return []
 
 
 
-def live_scanner(interval=2):
+
+def live_scanner(
+        interval=2
+):
 
     """
-    يفحص السوق كل ثانيتين
+    Scanner loop
+
+    كل interval ثانية
+    يجلب بيانات جديدة
     """
 
     while True:
 
-        pairs = fetch_pairs()
 
         print(
-            "Scanned:",
-            len(pairs),
-            "tokens"
+            "Scanning Solana..."
         )
 
 
-        yield pairs
+        pairs = fetch_pairs()
 
 
-        time.sleep(interval)
+
+        if pairs:
+
+
+            yield pairs
+
+
+        else:
+
+            print(
+                "No pairs found"
+            )
+
+
+        time.sleep(
+            interval
+        )
