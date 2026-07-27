@@ -1,58 +1,231 @@
-import random
+"""
+Ghost Engine Trade Simulator
+
+يحاول معرفة:
+- هل الدخول منطقي؟
+- تأثير السيولة
+- الانزلاق المتوقع
+- الربح المحتمل
+
+لا ينفذ أي صفقة.
+"""
+
+
+def safe_number(value):
+
+    try:
+
+        return float(value)
+
+    except:
+
+        return 0
+
+
 
 
 def simulate(pair):
 
-    liquidity = pair.get(
-        "liquidity",
-        {}
-    ).get(
-        "usd",
-        0
+
+    liquidity = safe_number(
+
+        pair.get(
+            "liquidity",
+            {}
+        ).get(
+            "usd",
+            0
+        )
+
     )
 
 
-    volume = pair.get(
-        "volume",
-        {}
-    ).get(
-        "h24",
-        0
+    volume = safe_number(
+
+        pair.get(
+            "volume",
+            {}
+        ).get(
+            "h24",
+            0
+        )
+
     )
 
 
-    if liquidity == 0:
+    buys = safe_number(
+
+        pair.get(
+            "txns",
+            {}
+        )
+        .get(
+            "h24",
+            {}
+        )
+        .get(
+            "buys",
+            0
+        )
+
+    )
+
+
+    sells = safe_number(
+
+        pair.get(
+            "txns",
+            {}
+        )
+        .get(
+            "h24",
+            {}
+        )
+        .get(
+            "sells",
+            0
+        )
+
+    )
+
+
+    # --------------------
+    # حماية السيولة
+    # --------------------
+
+    if liquidity < 5000:
+
+
         return {
-            "success":False,
-            "reason":"No liquidity"
+
+            "success": False,
+
+            "reason":
+            "Low liquidity"
+
         }
 
 
-    volume_ratio = volume / liquidity
+
+    # --------------------
+    # ضغط الشراء
+    # --------------------
+
+    if sells == 0:
+
+        buy_pressure = 100
+
+    else:
+
+        buy_pressure = (
+            buys /
+            sells
+        ) * 100
 
 
-    slippage = random.uniform(
-        0.5,
-        5
+
+    # --------------------
+    # نسبة التداول للسيولة
+    # --------------------
+
+    volume_ratio = (
+        volume /
+        liquidity
     )
 
 
-    expected_move = volume_ratio * 10
+
+    # --------------------
+    # تقدير الحركة
+    # --------------------
+
+    momentum = (
+
+        volume_ratio * 20
+
+        +
+
+        buy_pressure * 0.3
+
+    )
 
 
-    profit = expected_move - slippage
+
+    # --------------------
+    # Slippage تقريبي
+    # --------------------
+
+    if liquidity > 100000:
+
+        slippage = 0.5
+
+
+    elif liquidity > 20000:
+
+        slippage = 1.5
+
+
+    else:
+
+        slippage = 3
+
+
+
+
+    expected_profit = (
+
+        momentum
+
+        -
+
+        slippage
+
+    )
+
+
+
+    success = (
+
+        expected_profit > 5
+
+        and
+
+        buy_pressure > 120
+
+    )
 
 
 
     return {
 
-        "success":
-        profit > 5,
 
-        "expected_profit":
-        round(profit,2),
+        "success":
+        success,
+
+
+        "expected_profit_percent":
+        round(
+            expected_profit,
+            2
+        ),
+
+
+        "buy_pressure":
+        round(
+            buy_pressure,
+            2
+        ),
+
 
         "slippage":
-        round(slippage,2)
+        slippage,
+
+
+        "liquidity":
+        liquidity,
+
+
+        "volume":
+        volume
 
     }
