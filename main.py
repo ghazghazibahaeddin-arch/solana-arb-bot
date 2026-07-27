@@ -1,11 +1,39 @@
+"""
+Ghost Engine Main
+
+Live scanner
+Risk
+Fusion
+Score
+Simulation
+Learning
+"""
+
+
 from scanner import live_scanner
 from filters import filter_pairs
+
+from data_fusion_engine import build_token_profile
+
 from scorer import score_pair
-from risk_engine import check
-from ai_brain import analyze_token
+
+from simulator import simulate
+
+from learning_engine import (
+    create_learning_table,
+    save_prediction
+)
+
+from config import (
+    MIN_SCORE,
+    MAX_DAILY_TRADES
+)
 
 
-MAX_TRADES = 1000
+
+create_learning_table()
+
+
 
 trade_count = 0
 
@@ -14,51 +42,95 @@ trade_count = 0
 for pairs in live_scanner(2):
 
 
-    if trade_count >= MAX_TRADES:
-
-        print("Daily limit reached")
-
-        break
-
-
-
-    pairs = filter_pairs(pairs)
+    pairs = filter_pairs(
+        pairs
+    )
 
 
 
     for pair in pairs:
 
 
-        if not check(pair):
 
-            continue
+        if trade_count >= MAX_DAILY_TRADES:
 
+            print(
+                "Daily limit reached"
+            )
 
-
-        score = score_pair(pair)
-
-
-
-        if score < 85:
-
-            continue
+            break
 
 
 
-        ai = analyze_token(pair)
+        profile = build_token_profile(
+            pair
+        )
 
 
+        score = score_pair(
+            pair
+        )
 
-        print(
-            pair["baseToken"]["symbol"],
-            score,
-            ai
+
+        simulation = simulate(
+            pair
         )
 
 
 
-        # هنا فقط بعد simulator + wallet
+        print("="*50)
 
-        # execute_trade(pair)
+        print(
+            "TOKEN:",
+            profile["symbol"]
+        )
 
-        trade_count +=1
+        print(
+            "SCORE:",
+            score
+        )
+
+        print(
+            "SMART MONEY:",
+            profile["smart_money"]
+        )
+
+        print(
+            "SIMULATION:",
+            simulation
+        )
+
+
+
+        save_prediction(
+
+            profile["symbol"],
+
+            profile["address"],
+
+            score
+
+        )
+
+
+
+        if (
+
+            score >= MIN_SCORE
+
+            and
+
+            simulation.get(
+                "success",
+                False
+            )
+
+        ):
+
+
+            print(
+                "🔥 OPPORTUNITY FOUND"
+            )
+
+
+            trade_count += 1
