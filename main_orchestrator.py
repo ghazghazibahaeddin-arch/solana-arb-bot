@@ -1,92 +1,419 @@
+"""
+Ghost Engine Main Orchestrator
+
+Pipeline:
+
+Scanner
+ ↓
+Filters
+ ↓
+Risk
+ ↓
+Fusion
+ ↓
+Smart Money
+ ↓
+Pattern
+ ↓
+Score
+ ↓
+Simulator
+ ↓
+Decision
+ ↓
+Learning
+
+Includes:
+- Error recovery
+- Logging
+- Auto retry
+"""
+
+
 import time
-import sys
-from datetime import datetime
-from config import INITIAL_WALLET_BALANCE
-from engine import scan_smart_market
-from simulator import zero_error_simulation
-from ai_predictor import QuantumPredictor
-from ghost_consensus import GhostBlockEngine
-from dual_brain_swarm import DualBrainSwarm
+import traceback
+import logging
 
-# Initialize all unified components
-current_wallet = INITIAL_WALLET_BALANCE
-total_successful_trades = 0
-predictor = QuantumPredictor()
-ghost_engine = GhostBlockEngine()
-ai_swarm = DualBrainSwarm()
 
-def master_logger(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"[{timestamp}] {message}"
-    print(log_entry)
+from scanner import fetch_pairs
+
+from filters import filter_pairs
+
+from risk_engine import check
+
+from data_fusion_engine import build_token_profile
+
+from scorer import score_pair
+
+from simulator import simulate
+
+from decision_engine import decide
+
+from smart_wallet_tracker import analyze as smart_analyze
+
+from pattern_detector import detect_pattern
+
+from learning_engine import (
+    create_learning_table,
+    save_prediction
+)
+
+
+
+# -----------------------
+# Logging
+# -----------------------
+
+logging.basicConfig(
+
+    filename="ghost_engine.log",
+
+    level=logging.INFO,
+
+    format="%(asctime)s %(message)s"
+
+)
+
+
+
+# -----------------------
+# Settings
+# -----------------------
+
+SCAN_DELAY = 3
+
+MAX_ERRORS = 5
+
+
+
+def safe_run(function,*args):
+
+    """
+    يمنع توقف النظام
+    إذا فشل ملف معين
+    """
+
     try:
-        with open("master_quantum_system.log", "a", encoding="utf-8") as f:
-            f.write(log_entry + "\n")
-    except Exception:
-        pass
 
-def run_master_orchestrator():
-    global current_wallet, total_successful_trades
-    
-    master_logger("=" * 70)
-    master_logger(f"🌟 INITIALIZING MASTER QUANTUM ORCHESTRATOR | Wallet: ${current_wallet:.2f}")
-    master_logger("=" * 70)
-    
+        return function(*args)
+
+
+    except Exception as e:
+
+
+        logging.error(
+
+            f"{function.__name__}: {e}"
+
+        )
+
+
+        traceback.print_exc()
+
+
+        return None
+
+
+
+
+
+def process_pair(pair):
+
+
+    try:
+
+
+        # 1 Risk
+
+        if not check(pair):
+
+            return
+
+
+
+        # 2 Fusion
+
+        profile = safe_run(
+
+            build_token_profile,
+
+            pair
+
+        )
+
+
+        if not profile:
+
+            return
+
+
+
+        # 3 Score
+
+        score = safe_run(
+
+            score_pair,
+
+            pair
+
+        )
+
+
+        if score is None:
+
+            return
+
+
+
+
+        # 4 Simulation
+
+        simulation = safe_run(
+
+            simulate,
+
+            pair
+
+        )
+
+
+        if not simulation:
+
+            return
+
+
+
+
+        # 5 Smart Money
+
+        smart = safe_run(
+
+            smart_analyze,
+
+            pair
+
+        )
+
+
+
+        if smart is None:
+
+            smart = 0
+
+
+
+
+        # 6 Pattern
+
+        pattern = safe_run(
+
+            detect_pattern,
+
+            pair
+
+        )
+
+
+        if pattern is None:
+
+            pattern = 0
+
+
+
+
+
+        # 7 Decision
+
+        decision = decide(
+
+            score,
+
+            0,
+
+            simulation,
+
+            smart,
+
+            pattern
+
+        )
+
+
+
+
+
+        print("="*60)
+
+        print(
+
+            "TOKEN:",
+
+            profile["symbol"]
+
+        )
+
+
+        print(
+
+            "SCORE:",
+
+            score
+
+        )
+
+
+        print(
+
+            "SMART MONEY:",
+
+            smart
+
+        )
+
+
+        print(
+
+            "PATTERN:",
+
+            pattern
+
+        )
+
+
+        print(
+
+            "DECISION:",
+
+            decision
+
+        )
+
+
+
+
+
+        # Learning
+
+        save_prediction(
+
+            profile["symbol"],
+
+            profile["address"],
+
+            score
+
+        )
+
+
+
+    except Exception as e:
+
+
+        logging.error(
+
+            f"PAIR ERROR {e}"
+
+        )
+
+
+
+
+
+def start():
+
+
+    create_learning_table()
+
+
+    errors = 0
+
+
+
     while True:
+
+
         try:
-            # Step 1: Scan live market data
-            market_data = scan_smart_market()
-            
-            if market_data:
-                # Step 2: Zero-Error Simulation Shield Check
-                sim_result = zero_error_simulation(market_data)
-                
-                if sim_result.get("status") == "APPROVED":
-                    # Step 3: Predictive Momentum Matrix
-                    confidence = predictor.evaluate_market_momentum(
-                        market_data.get("liquidity_score", 0),
-                        market_data.get("slippage", 0)
-                    )
-                    
-                    # Step 4: Ghost Block Future State Verification
-                    ghost_state = ghost_engine.generate_ghost_state(
-                        market_data.get("buy_price", 0.0), 
-                        market_data.get("liquidity_score", 1.0)
-                    )
-                    is_ghost_safe = ghost_engine.verify_zero_loss_trajectory(
-                        market_data.get("buy_price", 0.0), 
-                        ghost_state
-                    )
-                    
-                    if confidence >= 0.85 and is_ghost_safe:
-                        # Step 5: Dual-Brain AI Swarm Consensus (Gemini + Groq)
-                        consensus = ai_swarm.reach_consensus(market_data)
-                        
-                        if consensus["consensus"] == "UNANIMOUS_APPROVED":
-                            profit = sim_result.get("net_profit", 0)
-                            total_successful_trades += 1
-                            current_wallet += profit # Compound interest growth
-                            
-                            master_logger(f"💎 [QUANTUM EXECUTION SUCCESS] Route: {sim_result['execution_path']} | Profit: +${profit:.4f} | Wallet: ${current_wallet:.4f} | Swarm Notes: {consensus['notes']}")
-                        else:
-                            master_logger(f"🤖 [AI SWARM VETO] Trade blocked by consensus: {consensus['notes']}")
-                    else:
-                        master_logger(f"👻 [GHOST BLOCK REJECT] Future volatility risk detected. Confidence: {confidence:.2f}")
-                else:
-                    master_logger(f"🛡️ [SIMULATION BLOCKED] Reason: {sim_result.get('reason', 'Risk Check Failed')}")
-            else:
-                master_logger("🔍 Scanning decentralized liquidity topology...")
-                
-            # Rate-limit delay to safeguard free RPC limits
-            time.sleep(3)
-            
-        except KeyboardInterrupt:
-            master_logger("🛑 Master Orchestrator safely terminated by user.")
-            break
+
+
+            print(
+                "Scanning..."
+            )
+
+
+            pairs = fetch_pairs()
+
+
+
+            if not pairs:
+
+
+                time.sleep(
+                    SCAN_DELAY
+                )
+
+                continue
+
+
+
+
+            pairs = filter_pairs(
+                pairs
+            )
+
+
+
+            for pair in pairs:
+
+
+                process_pair(
+                    pair
+                )
+
+
+
+            errors = 0
+
+
+
+            time.sleep(
+                SCAN_DELAY
+            )
+
+
+
         except Exception as e:
-            master_logger(f"❌ Critical Orchestrator Exception: {e}")
-            time.sleep(5)
+
+
+            errors += 1
+
+
+            logging.error(
+                f"MAIN LOOP ERROR {e}"
+            )
+
+
+
+            if errors >= MAX_ERRORS:
+
+
+                print(
+                    "Too many errors. Restart needed."
+                )
+
+
+                break
+
+
+
+            time.sleep(
+                5
+            )
+
+
+
+
 
 if __name__ == "__main__":
-    run_master_orchestrator()
-          
+
+
+    start()
