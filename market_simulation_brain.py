@@ -1,39 +1,47 @@
 """
 Ghost Engine - Market Simulation Brain
 
-Purpose:
-    Backtest the Ghost Intelligence strategy on REAL historical
-    observations collected by the system.
+Purpose
+-------
+Backtest the Ghost strategy against REAL historical snapshots
+stored in data/history.db.
 
-Important:
-    This module NEVER sends a real transaction.
-    It only simulates entries/exits and measures whether a strategy
-    would have worked historically.
+This module NEVER executes real trades.
 
-Core ideas:
-    1. Walk-forward simulation
-    2. No future-data leakage
-    3. Fees + slippage
-    4. Stop loss
-    5. Take profit
-    6. Maximum holding time
-    7. Drawdown measurement
-    8. Win rate
-    9. Profit factor
-    10. Expectancy
-    11. Monte-Carlo stress test
+Pipeline
+--------
+database.py
+    ↓
+REAL historical snapshots
+    ↓
+Market Simulation Brain
+    ↓
+Walk-forward backtest
+    ↓
+Risk / fee / slippage simulation
+    ↓
+Performance metrics
+    ↓
+Monte Carlo stress test
+
+Important
+---------
+A profitable backtest is NOT a guarantee of future profit.
+The engine refuses to call a strategy "credible" when there
+is insufficient evidence.
 """
 
 import os
-import sqlite3
 import random
+import sqlite3
 import statistics
+
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import Optional, List, Dict
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 DB_PATH = os.getenv(
@@ -48,6 +56,7 @@ INITIAL_CAPITAL = float(
     )
 )
 
+# Percentage of current capital risked per simulated trade.
 POSITION_SIZE_PCT = float(
     os.getenv(
         "SIM_POSITION_SIZE_PCT",
@@ -55,6 +64,7 @@ POSITION_SIZE_PCT = float(
     )
 )
 
+# Approximate total trading friction.
 FEE_RATE = float(
     os.getenv(
         "SIM_FEE_RATE",
@@ -97,9 +107,30 @@ MIN_SCORE = float(
     )
 )
 
+MIN_TRADES_FOR_CREDIBILITY = int(
+    os.getenv(
+        "SIM_MIN_TRADES",
+        "50"
+    )
+)
+
+MAX_ACCEPTABLE_DRAWDOWN = float(
+    os.getenv(
+        "SIM_MAX_DRAWDOWN",
+        "40"
+    )
+)
+
+MONTE_CARLO_RUNS = int(
+    os.getenv(
+        "SIM_MONTE_CARLO_RUNS",
+        "1000"
+    )
+)
+
 
 # ============================================================
-# DATA MODEL
+# DATA STRUCTURES
 # ============================================================
 
 @dataclass
@@ -116,10 +147,19 @@ class MarketPoint:
 class SimTrade:
 
     token: str
+
+    entry_timestamp: float
+    exit_timestamp: float
+
     entry_price: float
     exit_price: float
-    return_pct: float
+
+    gross_return_pct: float
+    net_return_pct: float
+
+    position_size: float
     pnl: float
+
     reason: str
     holding_periods: int
 
@@ -130,175 +170,159 @@ class SimTrade:
 
 def connect_db():
 
-    return sqlite3.connect(
-        DB_PATH
-    )
-
-
-def ensure_tables():
-
     os.makedirs(
         os.path.dirname(DB_PATH) or ".",
         exist_ok=True
     )
 
-    conn = connect_db()
-
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS simulation_results (
-
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            token TEXT,
-
-            entry_price REAL,
-
-            exit_price REAL,
-
-            return_pct REAL,
-
-            pnl REAL,
-
-            reason TEXT,
-
-            holding_periods INTEGER,
-
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-        """
+    return sqlite3.connect(
+        DB_PATH,
+        timeout=30
     )
 
-    conn.commit()
-    conn.close()
 
-
-# ============================================================
-# LOAD HISTORICAL DATA
-# ============================================================
-
-def find_columns():
+def ensure_simulation_table():
 
     conn = connect_db()
-
-    cur = conn.cursor()
 
     try:
 
-        cur.execute(
-            "PRAGMA table_info(tokens)"
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS simulation_results (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                token TEXT,
+
+                entry_timestamp REAL,
+
+                exit_timestamp REAL,
+
+                entry_price REAL,
+
+                exit_price REAL,
+
+                gross_return_pct REAL,
+
+                net_return_pct REAL,
+
+                position_size REAL,
+
+                pnl REAL,
+
+                reason TEXT,
+
+                holding_periods INTEGER,
+
+                timestamp DATETIME
+                    DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
 
-        rows = cur.fetchall()
+        conn.commit()
 
-    except Exception:
+    finally:
 
         conn.close()
 
-        return []
 
-    conn.close()
+# ============================================================
+# LOAD REAL HISTORICAL DATA
+# ============================================================
 
-    return [
-        row[1]
-        for row in rows
-    ]
-
-
-def load_history():
-
+def load_history() -> List[MarketPoint]:
     """
-    Tries to read historical observations from the existing
-    tokens table.
+    Read real observations previously collected by scanner.py.
 
-    Required:
-        price
+    Expected table:
+        tokens
 
-    Optional:
-        symbol
+    Expected columns:
         address
+        price
         score
         timestamp
     """
 
-    columns = find_columns()
-
-    if "price" not in columns:
+    if not os.path.exists(DB_PATH):
 
         return []
-
-    token_column = (
-        "address"
-        if "address" in columns
-        else "symbol"
-        if "symbol" in columns
-        else None
-    )
-
-    score_column = (
-        "score"
-        if "score" in columns
-        else None
-    )
-
-    timestamp_column = (
-        "timestamp"
-        if "timestamp" in columns
-        else None
-    )
-
-    selected = []
-
-    selected.append(
-        token_column
-        if token_column
-        else "''"
-    )
-
-    selected.append("price")
-
-    selected.append(
-        score_column
-        if score_column
-        else "0"
-    )
-
-    selected.append(
-        timestamp_column
-        if timestamp_column
-        else "rowid"
-    )
-
-    query = f"""
-        SELECT
-            {selected[0]},
-            {selected[1]},
-            {selected[2]},
-            {selected[3]}
-        FROM tokens
-        WHERE price > 0
-        ORDER BY {selected[3]} ASC
-    """
 
     conn = connect_db()
 
-    cur = conn.cursor()
-
     try:
 
-        cur.execute(query)
+        cursor = conn.cursor()
 
-        rows = cur.fetchall()
+        cursor.execute(
+            "PRAGMA table_info(tokens)"
+        )
 
-    except Exception:
+        columns = {
+            row[1]
+            for row in cursor.fetchall()
+        }
 
-        conn.close()
+        required = {
+            "address",
+            "price",
+            "timestamp"
+        }
+
+        if not required.issubset(columns):
+
+            return []
+
+        score_expression = (
+            "score"
+            if "score" in columns
+            else "0"
+        )
+
+        risk_expression = (
+            "risk"
+            if "risk" in columns
+            else "0"
+        )
+
+        cursor.execute(
+            f"""
+            SELECT
+                address,
+                price,
+                {score_expression},
+                {risk_expression},
+                timestamp
+
+            FROM tokens
+
+            WHERE
+                address IS NOT NULL
+                AND address != ''
+                AND price > 0
+                AND timestamp IS NOT NULL
+
+            ORDER BY
+                address ASC,
+                timestamp ASC
+            """
+        )
+
+        rows = cursor.fetchall()
+
+    except sqlite3.Error as error:
+
+        print(
+            f"[SIM] Database error: {error}"
+        )
 
         return []
 
-    conn.close()
+    finally:
+
+        conn.close()
 
     points = []
 
@@ -306,24 +330,35 @@ def load_history():
 
         try:
 
-            token = str(row[0])
-
-            price = float(row[1])
-
-            score = float(row[2] or 0)
-
-            timestamp = float(row[3])
-
             points.append(
                 MarketPoint(
-                    token=token,
-                    timestamp=timestamp,
-                    price=price,
-                    score=score
+
+                    token=str(
+                        row[0]
+                    ),
+
+                    price=float(
+                        row[1]
+                    ),
+
+                    score=float(
+                        row[2] or 0
+                    ),
+
+                    risk=float(
+                        row[3] or 0
+                    ),
+
+                    timestamp=float(
+                        row[4]
+                    )
                 )
             )
 
-        except Exception:
+        except (
+            TypeError,
+            ValueError
+        ):
 
             continue
 
@@ -331,7 +366,7 @@ def load_history():
 
 
 # ============================================================
-# GROUP HISTORY BY TOKEN
+# GROUP BY TOKEN
 # ============================================================
 
 def group_by_token(
@@ -350,45 +385,77 @@ def group_by_token(
     for token in grouped:
 
         grouped[token].sort(
-            key=lambda x: x.timestamp
+            key=lambda p: p.timestamp
         )
 
     return grouped
 
 
 # ============================================================
-# SIMULATED EXIT
+# ENTRY FILTER
+# ============================================================
+
+def should_enter(
+    point: MarketPoint
+):
+    """
+    Entry decision uses ONLY information available
+    at this exact observation.
+    """
+
+    if point.price <= 0:
+
+        return False
+
+    if point.score < MIN_SCORE:
+
+        return False
+
+    if point.risk > 50:
+
+        return False
+
+    return True
+
+
+# ============================================================
+# EXIT SIMULATION
 # ============================================================
 
 def simulate_exit(
     history: List[MarketPoint],
     entry_index: int
 ):
+    """
+    Simulate what would have happened AFTER entry.
 
-    entry = history[entry_index]
+    Future observations are used ONLY to determine
+    the outcome of an already-entered simulated trade.
+    """
+
+    entry = history[
+        entry_index
+    ]
 
     entry_price = entry.price
 
-    if entry_price <= 0:
-
-        return None
-
-    max_index = min(
+    last_index = min(
         len(history) - 1,
+
         entry_index
         +
         MAX_HOLD_OBSERVATIONS
     )
 
-    for i in range(
+    for index in range(
         entry_index + 1,
-        max_index + 1
+        last_index + 1
     ):
 
-        current = history[i]
+        point = history[index]
 
         change = (
-            current.price
+            point.price
             /
             entry_price
             -
@@ -397,23 +464,33 @@ def simulate_exit(
 
         if change <= -STOP_LOSS_PCT:
 
-            return current, "STOP_LOSS", i - entry_index
+            return (
+                point,
+                "STOP_LOSS",
+                index - entry_index
+            )
 
         if change >= TAKE_PROFIT_PCT:
 
-            return current, "TAKE_PROFIT", i - entry_index
+            return (
+                point,
+                "TAKE_PROFIT",
+                index - entry_index
+            )
 
-    exit_point = history[max_index]
+    point = history[
+        last_index
+    ]
 
     return (
-        exit_point,
+        point,
         "TIME_EXIT",
-        max_index - entry_index
+        last_index - entry_index
     )
 
 
 # ============================================================
-# SINGLE TRADE
+# SINGLE SIMULATED TRADE
 # ============================================================
 
 def simulate_trade(
@@ -422,9 +499,17 @@ def simulate_trade(
     capital: float
 ):
 
-    entry = history[entry_index]
+    entry = history[
+        entry_index
+    ]
 
-    if entry.score < MIN_SCORE:
+    if not should_enter(
+        entry
+    ):
+
+        return None, capital
+
+    if entry_index >= len(history) - 1:
 
         return None, capital
 
@@ -433,7 +518,7 @@ def simulate_trade(
         entry_index
     )
 
-    if not result:
+    if result is None:
 
         return None, capital
 
@@ -441,6 +526,10 @@ def simulate_trade(
 
     entry_price = entry.price
     exit_price = exit_point.price
+
+    if entry_price <= 0:
+
+        return None, capital
 
     gross_return = (
         exit_price
@@ -450,45 +539,70 @@ def simulate_trade(
         1
     )
 
-    # Entry + exit friction.
-    effective_return = (
-        gross_return
-        -
+    # Entry and exit friction.
+    total_cost = (
         FEE_RATE * 2
-        -
+        +
         SLIPPAGE_RATE * 2
     )
 
-    position_value = (
+    net_return = (
+        gross_return
+        -
+        total_cost
+    )
+
+    position_size = (
         capital
         *
         POSITION_SIZE_PCT
     )
 
     pnl = (
-        position_value
+        position_size
         *
-        effective_return
+        net_return
     )
 
-    new_capital = capital + pnl
+    new_capital = (
+        capital
+        +
+        pnl
+    )
+
+    # Capital can never become negative in this simulator.
+    new_capital = max(
+        new_capital,
+        0
+    )
 
     trade = SimTrade(
 
         token=entry.token,
 
+        entry_timestamp=entry.timestamp,
+
+        exit_timestamp=exit_point.timestamp,
+
         entry_price=entry_price,
 
         exit_price=exit_price,
 
-        return_pct=effective_return * 100,
+        gross_return_pct=(
+            gross_return * 100
+        ),
+
+        net_return_pct=(
+            net_return * 100
+        ),
+
+        position_size=position_size,
 
         pnl=pnl,
 
         reason=reason,
 
         holding_periods=holding
-
     )
 
     return trade, new_capital
@@ -499,8 +613,16 @@ def simulate_trade(
 # ============================================================
 
 def run_backtest(
-    points: Optional[List[MarketPoint]] = None
+    points: Optional[
+        List[MarketPoint]
+    ] = None
 ):
+    """
+    Walk through historical data chronologically.
+
+    No future observation is used to decide whether
+    an entry signal existed.
+    """
 
     if points is None:
 
@@ -511,8 +633,10 @@ def run_backtest(
         return {
             "status": "NO_DATA",
             "message": (
-                "Not enough historical observations."
-            )
+                "No historical snapshots "
+                "were found in the database."
+            ),
+            "trades": []
         }
 
     grouped = group_by_token(
@@ -520,8 +644,6 @@ def run_backtest(
     )
 
     capital = INITIAL_CAPITAL
-
-    starting_capital = capital
 
     trades = []
 
@@ -531,32 +653,46 @@ def run_backtest(
 
             continue
 
-        # Important:
-        # We only use information available at the
-        # entry point. We never look into the future
-        # to decide whether to enter.
+        index = 0
 
-        for i in range(
-            len(history) - 1
-        ):
+        while index < len(history) - 1:
 
-            trade, capital = simulate_trade(
+            trade, new_capital = simulate_trade(
                 history,
-                i,
+                index,
                 capital
             )
 
-            if trade:
+            if trade is None:
 
-                trades.append(
-                    trade
-                )
+                index += 1
 
-    return build_report(
-        starting_capital,
+                continue
+
+            trades.append(
+                trade
+            )
+
+            capital = new_capital
+
+            # Do not open another simulated position
+            # while the previous one is still active.
+            index += max(
+                trade.holding_periods,
+                1
+            )
+
+    report = build_report(
+        INITIAL_CAPITAL,
         capital,
         trades
     )
+
+    return {
+        "status": report["status"],
+        "report": report,
+        "trades": trades
+    }
 
 
 # ============================================================
@@ -573,32 +709,41 @@ def build_report(
 
         return {
             "status": "NO_TRADES",
+
             "starting_capital":
                 starting_capital,
+
             "final_capital":
                 final_capital,
-            "trades": 0
+
+            "return_pct":
+                0,
+
+            "trades":
+                0
         }
 
     wins = [
-        t for t in trades
-        if t.pnl > 0
+        trade
+        for trade in trades
+        if trade.pnl > 0
     ]
 
     losses = [
-        t for t in trades
-        if t.pnl < 0
+        trade
+        for trade in trades
+        if trade.pnl < 0
     ]
 
     total_profit = sum(
-        t.pnl
-        for t in wins
+        trade.pnl
+        for trade in wins
     )
 
     total_loss = abs(
         sum(
-            t.pnl
-            for t in losses
+            trade.pnl
+            for trade in losses
         )
     )
 
@@ -610,21 +755,23 @@ def build_report(
         100
     )
 
-    profit_factor = (
-        total_profit
-        /
-        total_loss
-        if total_loss > 0
-        else float("inf")
-    )
+    if total_loss > 0:
 
-    expectancy = (
-        sum(
-            t.return_pct
-            for t in trades
+        profit_factor = (
+            total_profit
+            /
+            total_loss
         )
-        /
-        len(trades)
+
+    else:
+
+        profit_factor = float(
+            "inf"
+        )
+
+    expectancy = statistics.mean(
+        trade.net_return_pct
+        for trade in trades
     )
 
     return_pct = (
@@ -640,6 +787,24 @@ def build_report(
         starting_capital
     )
 
+    average_win = (
+        statistics.mean(
+            trade.net_return_pct
+            for trade in wins
+        )
+        if wins
+        else 0
+    )
+
+    average_loss = (
+        statistics.mean(
+            trade.net_return_pct
+            for trade in losses
+        )
+        if losses
+        else 0
+    )
+
     return {
 
         "status": "OK",
@@ -647,13 +812,13 @@ def build_report(
         "starting_capital":
             round(
                 starting_capital,
-                4
+                6
             ),
 
         "final_capital":
             round(
                 final_capital,
-                4
+                6
             ),
 
         "return_pct":
@@ -678,16 +843,31 @@ def build_report(
             ),
 
         "profit_factor":
-            round(
-                profit_factor,
-                3
-            )
-            if profit_factor != float("inf")
-            else "INF",
+            (
+                "INF"
+                if profit_factor
+                == float("inf")
+                else round(
+                    profit_factor,
+                    4
+                )
+            ),
 
         "expectancy_pct":
             round(
                 expectancy,
+                4
+            ),
+
+        "average_win_pct":
+            round(
+                average_win,
+                4
+            ),
+
+        "average_loss_pct":
+            round(
+                average_loss,
                 4
             ),
 
@@ -709,10 +889,8 @@ def calculate_drawdown(
 ):
 
     capital = starting_capital
-
     peak = capital
-
-    maximum = 0
+    maximum_drawdown = 0
 
     for trade in trades:
 
@@ -722,118 +900,142 @@ def calculate_drawdown(
 
             peak = capital
 
-        if peak > 0:
+        if peak <= 0:
 
-            drawdown = (
-                peak - capital
-            ) / peak * 100
+            continue
 
-            maximum = max(
-                maximum,
-                drawdown
-            )
+        drawdown = (
+            peak
+            -
+            capital
+        ) / peak * 100
 
-    return maximum
+        maximum_drawdown = max(
+            maximum_drawdown,
+            drawdown
+        )
+
+    return maximum_drawdown
 
 
 # ============================================================
-# MONTE CARLO STRESS TEST
+# MONTE CARLO
 # ============================================================
 
 def monte_carlo(
     trades,
-    simulations=1000
+    simulations=MONTE_CARLO_RUNS
 ):
+    """
+    Randomizes the order of historical trade returns.
+
+    This tests how sensitive the result is to trade ordering.
+    """
 
     if not trades:
 
-        return {}
+        return {
+            "status": "NO_DATA"
+        }
 
     returns = [
-        t.return_pct / 100
-        for t in trades
+        trade.net_return_pct / 100
+        for trade in trades
     ]
 
-    final_results = []
+    final_capitals = []
 
     for _ in range(
         simulations
     ):
 
-        capital = INITIAL_CAPITAL
-
-        shuffled = returns.copy()
+        shuffled = list(
+            returns
+        )
 
         random.shuffle(
             shuffled
         )
 
-        for r in shuffled:
+        capital = INITIAL_CAPITAL
 
-            position = (
+        for trade_return in shuffled:
+
+            position_size = (
                 capital
                 *
                 POSITION_SIZE_PCT
             )
 
-            capital += (
-                position * r
+            pnl = (
+                position_size
+                *
+                trade_return
             )
 
-        final_results.append(
+            capital += pnl
+
+            capital = max(
+                capital,
+                0
+            )
+
+        final_capitals.append(
             capital
         )
 
-    final_results.sort()
+    final_capitals.sort()
 
     return {
+
+        "status": "OK",
 
         "simulations":
             simulations,
 
         "worst":
             round(
-                final_results[0],
-                4
+                final_capitals[0],
+                6
             ),
 
         "p05":
             round(
                 percentile(
-                    final_results,
+                    final_capitals,
                     5
                 ),
-                4
+                6
             ),
 
         "median":
             round(
                 statistics.median(
-                    final_results
+                    final_capitals
                 ),
-                4
+                6
             ),
 
         "p95":
             round(
                 percentile(
-                    final_results,
+                    final_capitals,
                     95
                 ),
-                4
+                6
             ),
 
         "best":
             round(
-                final_results[-1],
-                4
+                final_capitals[-1],
+                6
             )
     }
 
 
 def percentile(
     values,
-    p
+    percentage
 ):
 
     if not values:
@@ -842,7 +1044,9 @@ def percentile(
 
     index = (
         len(values) - 1
-    ) * p / 100
+    ) * (
+        percentage / 100
+    )
 
     lower = int(index)
 
@@ -851,7 +1055,9 @@ def percentile(
         len(values) - 1
     )
 
-    fraction = index - lower
+    fraction = (
+        index - lower
+    )
 
     return (
         values[lower]
@@ -867,143 +1073,211 @@ def percentile(
 
 
 # ============================================================
-# SAVE RESULTS
+# SAVE SIMULATED TRADES
 # ============================================================
 
 def save_trades(
     trades
 ):
 
-    ensure_tables()
+    if not trades:
+
+        return
+
+    ensure_simulation_table()
 
     conn = connect_db()
 
-    cur = conn.cursor()
+    try:
 
-    for trade in trades:
+        for trade in trades:
 
-        cur.execute(
-            """
-            INSERT INTO simulation_results
-            (
-                token,
-                entry_price,
-                exit_price,
-                return_pct,
-                pnl,
-                reason,
-                holding_periods
+            conn.execute(
+                """
+                INSERT INTO simulation_results (
+
+                    token,
+                    entry_timestamp,
+                    exit_timestamp,
+                    entry_price,
+                    exit_price,
+                    gross_return_pct,
+                    net_return_pct,
+                    position_size,
+                    pnl,
+                    reason,
+                    holding_periods
+
+                )
+
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )
+                """,
+                (
+                    trade.token,
+
+                    trade.entry_timestamp,
+
+                    trade.exit_timestamp,
+
+                    trade.entry_price,
+
+                    trade.exit_price,
+
+                    trade.gross_return_pct,
+
+                    trade.net_return_pct,
+
+                    trade.position_size,
+
+                    trade.pnl,
+
+                    trade.reason,
+
+                    trade.holding_periods
+                )
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                trade.token,
-                trade.entry_price,
-                trade.exit_price,
-                trade.return_pct,
-                trade.pnl,
-                trade.reason,
-                trade.holding_periods
-            )
-        )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+
+    finally:
+
+        conn.close()
 
 
 # ============================================================
-# STRATEGY QUALITY CHECK
+# CREDIBILITY CHECK
 # ============================================================
 
 def strategy_is_credible(
     report,
-    monte_carlo_report
+    mc_report
 ):
+    """
+    Conservative gate.
 
-    if report.get("status") != "OK":
+    A strategy is NOT considered credible merely because
+    the final capital increased.
+    """
 
-        return False
-
-    if report["trades"] < 50:
-
-        return False
-
-    if report["expectancy_pct"] <= 0:
+    if not report:
 
         return False
 
-    if report["profit_factor"] != "INF":
+    if report.get(
+        "status"
+    ) != "OK":
 
-        if report["profit_factor"] < 1.20:
+        return False
+
+    if report.get(
+        "trades",
+        0
+    ) < MIN_TRADES_FOR_CREDIBILITY:
+
+        return False
+
+    if report.get(
+        "expectancy_pct",
+        0
+    ) <= 0:
+
+        return False
+
+    profit_factor = report.get(
+        "profit_factor"
+    )
+
+    if profit_factor != "INF":
+
+        if profit_factor < 1.20:
 
             return False
 
-    if report["max_drawdown_pct"] > 40:
+    if report.get(
+        "max_drawdown_pct",
+        100
+    ) > MAX_ACCEPTABLE_DRAWDOWN:
 
         return False
 
-    if monte_carlo_report:
+    if mc_report.get(
+        "status"
+    ) != "OK":
 
-        if (
-            monte_carlo_report["p05"]
-            <
-            INITIAL_CAPITAL * 0.50
-        ):
+        return False
 
-            return False
+    # If the 5th percentile scenario loses
+    # more than half the starting capital,
+    # reject the strategy.
+    if mc_report.get(
+        "p05",
+        0
+    ) < INITIAL_CAPITAL * 0.50:
+
+        return False
 
     return True
 
 
 # ============================================================
-# FULL ANALYSIS
+# COMPLETE ANALYSIS
 # ============================================================
 
 def analyze_strategy():
 
-    ensure_tables()
+    ensure_simulation_table()
 
     points = load_history()
 
-    report = run_backtest(
+    if not points:
+
+        return {
+
+            "status": "NO_DATA",
+
+            "message": (
+                "No real historical snapshots "
+                "are available yet. "
+                "Run scanner.py first."
+            )
+        }
+
+    result = run_backtest(
         points
     )
 
-    trades = []
+    report = result.get(
+        "report"
+    )
 
-    if points:
+    trades = result.get(
+        "trades",
+        []
+    )
 
-        grouped = group_by_token(
-            points
-        )
+    if not trades:
 
-        capital = INITIAL_CAPITAL
+        return {
 
-        for token, history in grouped.items():
+            "status": "NO_TRADES",
 
-            for i in range(
-                len(history) - 1
-            ):
-
-                trade, capital = simulate_trade(
-                    history,
-                    i,
-                    capital
-                )
-
-                if trade:
-
-                    trades.append(
-                        trade
-                    )
+            "message": (
+                "Historical data exists, "
+                "but the current strategy "
+                "did not produce qualifying "
+                "entries."
+            )
+        }
 
     save_trades(
         trades
     )
 
     mc = monte_carlo(
-        trades,
-        simulations=1000
+        trades
     )
 
     credible = strategy_is_credible(
@@ -1012,6 +1286,8 @@ def analyze_strategy():
     )
 
     return {
+
+        "status": "OK",
 
         "backtest":
             report,
@@ -1022,39 +1298,59 @@ def analyze_strategy():
         "credible":
             credible,
 
-        "message":
-            (
-                "Strategy passed the "
-                "current historical tests."
-                if credible
-                else
-                "Strategy needs more "
-                "data or improvement."
-            )
+        "message": (
+            "Strategy passed the current "
+            "historical validation gates."
+            if credible
+            else
+            "Strategy did NOT pass the "
+            "current validation gates."
+        )
     }
 
 
 # ============================================================
-# CLI
+# PRINT REPORT
 # ============================================================
 
-if __name__ == "__main__":
+def print_report(
+    result
+):
 
     print()
-    print("=" * 60)
-    print("GHOST MARKET SIMULATION BRAIN")
-    print("=" * 60)
-
-    result = analyze_strategy()
+    print("=" * 65)
+    print(
+        "GHOST MARKET SIMULATION BRAIN"
+    )
+    print("=" * 65)
 
     print()
+
+    if result.get(
+        "status"
+    ) != "OK":
+
+        print(
+            result.get(
+                "message",
+                "No result."
+            )
+        )
+
+        return
+
+    report = result[
+        "backtest"
+    ]
+
+    mc = result[
+        "monte_carlo"
+    ]
 
     print("BACKTEST")
-    print("-" * 60)
+    print("-" * 65)
 
-    for key, value in result[
-        "backtest"
-    ].items():
+    for key, value in report.items():
 
         print(
             f"{key}: {value}"
@@ -1063,11 +1359,9 @@ if __name__ == "__main__":
     print()
 
     print("MONTE CARLO")
-    print("-" * 60)
+    print("-" * 65)
 
-    for key, value in result[
-        "monte_carlo"
-    ].items():
+    for key, value in mc.items():
 
         print(
             f"{key}: {value}"
@@ -1085,3 +1379,18 @@ if __name__ == "__main__":
     print(
         result["message"]
     )
+
+    print()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    result = analyze_strategy()
+
+    print_report(
+        result
+)
