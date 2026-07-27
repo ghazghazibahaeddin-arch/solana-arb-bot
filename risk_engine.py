@@ -1,45 +1,40 @@
 """
 Ghost Engine Risk Engine
 
-يفحص:
-- السيولة
-- ضغط البيع
-- توزيع التداول
-- عمر الزوج
-- مخاطر المطور
-
-يعطي:
-True = يسمح بالمرور
-False = يرفض
+Combines:
+- Liquidity risk
+- Volume anomaly
+- Buy/Sell pressure
+- Rug detector
+- Holder distribution
+- Dev wallet
 """
-
 
 from config import MIN_LIQUIDITY
 
+from rug_detector import detect_rug
 
 
-def number(value):
+
+def num(value):
 
     try:
-
         return float(value)
 
     except:
-
         return 0
 
 
 
-
-def get_risk_score(pair):
+def market_risk(pair):
 
 
     risk = 0
 
+    reasons = []
 
 
-    liquidity = number(
-
+    liquidity = num(
         pair.get(
             "liquidity",
             {}
@@ -47,13 +42,10 @@ def get_risk_score(pair):
             "usd",
             0
         )
-
     )
 
 
-
-    volume = number(
-
+    volume = num(
         pair.get(
             "volume",
             {}
@@ -61,13 +53,10 @@ def get_risk_score(pair):
             "h24",
             0
         )
-
     )
 
 
-
-    buys = number(
-
+    buys = num(
         pair.get(
             "txns",
             {}
@@ -80,13 +69,10 @@ def get_risk_score(pair):
             "buys",
             0
         )
-
     )
 
 
-
-    sells = number(
-
+    sells = num(
         pair.get(
             "txns",
             {}
@@ -99,99 +85,96 @@ def get_risk_score(pair):
             "sells",
             0
         )
-
     )
 
 
+    # Liquidity
 
-    # -------------------
-    # Liquidity Risk
-    # -------------------
+    if liquidity < MIN_LIQUIDITY:
 
+        risk += 30
 
-    if liquidity < 5000:
-
-        risk += 40
-
-
-    elif liquidity < MIN_LIQUIDITY:
-
-        risk += 20
+        reasons.append(
+            "Low liquidity"
+        )
 
 
-
-
-    # -------------------
-    # Fake Volume Risk
-    # -------------------
-
+    # Fake volume
 
     if liquidity > 0:
-
 
         ratio = volume / liquidity
 
 
-        # حجم ضخم مقارنة بالسيولة
-
         if ratio > 100:
 
-            risk += 30
+            risk += 25
+
+            reasons.append(
+                "Possible fake volume"
+            )
 
 
-
-
-    # -------------------
-    # Sell Pressure
-    # -------------------
-
+    # Sell pressure
 
     if sells > buys * 2:
 
         risk += 25
 
-
-
-    # -------------------
-    # Transaction Risk
-    # -------------------
-
-
-    total_tx = buys + sells
-
-
-    if total_tx < 10:
-
-        risk += 20
+        reasons.append(
+            "Heavy sell pressure"
+        )
 
 
 
-    return min(
-        risk,
-        100
-    )
+    # Transaction activity
 
+    if buys + sells < 10:
+
+        risk += 15
+
+        reasons.append(
+            "Low activity"
+        )
+
+
+
+    return {
+        "risk": min(risk,100),
+        "reasons": reasons
+    }
 
 
 
 def check(pair):
 
 
-    risk = get_risk_score(
+    result = market_risk(
         pair
+    )
+
+
+    rug = detect_rug(
+        pair
+    )
+
+
+    final_risk = max(
+
+        result["risk"],
+
+        rug["rug_risk"]
+
     )
 
 
     print(
         "Risk:",
-        risk
+        final_risk
     )
 
 
-
-    # كلما كان أقل أفضل
-
-    if risk >= 60:
+    if final_risk >= 60:
 
         return False
 
