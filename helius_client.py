@@ -3,7 +3,7 @@ import requests
 
 
 KEY=os.getenv(
-"5ee01e91-4efc-43b0-81f3-2b81d2ea7437"
+"HELIUS_API_KEY"
 )
 
 
