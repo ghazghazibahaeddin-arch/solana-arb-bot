@@ -1,1 +1,13 @@
 requests
+python-dotenv
+
+numpy
+pandas
+
+sqlite-utils
+
+google-generativeai
+groq
+
+websockets
+aiohttp
