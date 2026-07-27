@@ -1,0 +1,14 @@
+{
+  "safe_mode": true,
+  "reason": "startup",
+  "timestamp": 0,
+  "last_error": null,
+  "last_recovery": null,
+  "last_scan": 0,
+  "last_successful_scan": 0,
+  "last_heartbeat": 0,
+  "last_api_success": 0,
+  "last_database_write": 0,
+  "scan_count": 0,
+  "errors": 0
+}
