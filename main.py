@@ -1,43 +1,64 @@
-from scanner import fetch_pairs
+from scanner import live_scanner
 from filters import filter_pairs
 from scorer import score_pair
-from logger import save_pairs
-
 from risk_engine import check
-from simulator import simulate
-from smart_money import analyze
-from whale_detector import detect
+from ai_brain import analyze_token
 
-pairs = fetch_pairs()
 
-pairs = filter_pairs(pairs)
+MAX_TRADES = 1000
 
-results = []
+trade_count = 0
 
-for pair in pairs:
 
-    if not check(pair):
-        continue
 
-    pair["score"] = score_pair(pair)
-    pair["simulation"] = simulate(pair)
-    pair["smart_money"] = analyze(pair)
-    pair["whale"] = detect(pair)
+for pairs in live_scanner(2):
 
-    results.append(pair)
 
-results.sort(key=lambda x: x["score"], reverse=True)
+    if trade_count >= MAX_TRADES:
 
-save_pairs(results)
+        print("Daily limit reached")
 
-for pair in results[:10]:
+        break
 
-    print("=" * 50)
-    print("Token :", pair["baseToken"]["symbol"])
-    print("Score :", pair["score"])
-    print("Price :", pair["priceUsd"])
-    print("Liquidity :", pair["liquidity"]["usd"])
-    print("Volume :", pair["volume"]["h24"])
-    print("Smart Money :", pair["smart_money"])
-    print("Whale :", pair["whale"])
-    print("Simulation :", pair["simulation"])
+
+
+    pairs = filter_pairs(pairs)
+
+
+
+    for pair in pairs:
+
+
+        if not check(pair):
+
+            continue
+
+
+
+        score = score_pair(pair)
+
+
+
+        if score < 85:
+
+            continue
+
+
+
+        ai = analyze_token(pair)
+
+
+
+        print(
+            pair["baseToken"]["symbol"],
+            score,
+            ai
+        )
+
+
+
+        # هنا فقط بعد simulator + wallet
+
+        # execute_trade(pair)
+
+        trade_count +=1
