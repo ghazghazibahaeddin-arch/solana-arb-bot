@@ -1,14 +1,76 @@
-from pattern_detector import detect_pattern
-from smart_money import analyze
+"""
+Ghost Engine Scoring System
+
+Input:
+    Unified token data from:
+    - DexScreener
+    - GeckoTerminal
+    - Helius
+    - Birdeye
+    - Learning Engine
+    - Smart Wallet Tracker
+
+Output:
+    Score 0-100
+"""
+
+
+from smart_wallet_tracker import smart_wallet_score
+from learning_engine import prediction_score
+
+
+
+def clamp(value, minimum=0, maximum=100):
+
+    return max(
+        minimum,
+        min(
+            value,
+            maximum
+        )
+    )
+
+
+
+def normalize(value, max_value):
+
+    if max_value <= 0:
+        return 0
+
+    return clamp(
+        (value / max_value) * 100
+    )
+
+
+
+def calculate_buy_pressure(
+        buys,
+        sells
+):
+
+    if sells == 0:
+
+        if buys > 0:
+            return 100
+
+        return 0
+
+
+    ratio = buys / sells
+
+
+    return clamp(
+        ratio * 50
+    )
 
 
 
 def score_pair(pair):
 
 
-    score = 0
-
-
+    # -------------------------
+    # DexScreener Data
+    # -------------------------
 
     liquidity = pair.get(
         "liquidity",
@@ -17,7 +79,6 @@ def score_pair(pair):
         "usd",
         0
     )
-
 
 
     volume = pair.get(
@@ -29,84 +90,115 @@ def score_pair(pair):
     )
 
 
-
-    buys = pair.get(
+    txns = pair.get(
         "txns",
         {}
     ).get(
         "h24",
         {}
-    ).get(
+    )
+
+
+    buys = txns.get(
         "buys",
         0
     )
 
 
-
-    sells = pair.get(
-        "txns",
-        {}
-    ).get(
-        "h24",
-        {}
-    ).get(
+    sells = txns.get(
         "sells",
         0
     )
 
 
+    # -------------------------
+    # Basic Market Signals
+    # -------------------------
 
-    # Liquidity
-
-    if liquidity > 100000:
-        score +=25
-
-    elif liquidity > 30000:
-        score +=15
-
-
-
-    # Volume
-
-    if volume > 1000000:
-        score +=25
-
-    elif volume > 300000:
-        score +=15
+    liquidity_score = normalize(
+        liquidity,
+        200000
+    )
 
 
-
-    # Buyers
-
-    if buys > sells:
-        score +=15
-
+    volume_score = normalize(
+        volume,
+        1000000
+    )
 
 
-    # Volume / liquidity
-
-    if liquidity > 0:
-
-        ratio = volume/liquidity
-
-        if ratio > 3:
-            score +=15
+    buy_pressure = calculate_buy_pressure(
+        buys,
+        sells
+    )
 
 
+    # -------------------------
+    # Smart Money
+    # -------------------------
 
-    smart = analyze(pair)
+    try:
 
-    score += smart * 0.1
+        smart_score = smart_wallet_score(
+            pair
+        )
+
+    except Exception:
+
+        smart_score = 0
 
 
 
-    pattern = detect_pattern(pair)
+    # -------------------------
+    # Historical Learning
+    # -------------------------
 
-    score += pattern * 0.1
+    try:
 
+        history_score = prediction_score(
+            pair
+        )
+
+    except Exception:
+
+        history_score = 0
+
+
+
+    # -------------------------
+    # Final Weighted Score
+    # -------------------------
+
+    final_score = (
+
+        liquidity_score * 0.25 +
+
+        volume_score * 0.25 +
+
+        buy_pressure * 0.20 +
+
+        smart_score * 0.15 +
+
+        history_score * 0.15
+
+    )
 
 
     return round(
-        min(score,100),
+        clamp(final_score),
         2
     )
+
+
+
+def should_trade(
+        score,
+        minimum=85
+):
+
+    """
+    Entry filter.
+    لا يعني ضمان الربح.
+    """
+
+    return score >= minimum
