@@ -1,17 +1,13 @@
 """
 Ghost Engine - Main Orchestrator
 
-Pipeline:
+Live pipeline:
 
-Live Data
-   ↓
-Network Guard
-   ↓
 Scanner
    ↓
 Filters
    ↓
-Risk Engine
+Risk
    ↓
 Data Fusion
    ↓
@@ -25,24 +21,35 @@ Simulation
    ↓
 Decision
    ↓
-Learning Database
+Learning
+
+The engine scans continuously.
+
+It does NOT force 10 trades/day.
+It can execute up to MAX_DAILY_TRADES when genuine
+opportunities are detected.
+
+Default:
+    scan every 3 seconds
+    maximum 50 trades/day
+    paper mode
 
 IMPORTANT:
-This file does NOT force trades.
-If data is missing, stale, inconsistent, or unsafe:
-NO TRADE.
+This file only decides whether an opportunity is tradeable.
+Actual live execution must be handled by trade_manager.py.
 """
 
 import json
 import logging
 import os
 import time
-from datetime import datetime
+
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
 
 # ============================================================
-# OPTIONAL / REQUIRED MODULES
+# MODULES
 # ============================================================
 
 from scanner import fetch_pairs
@@ -51,9 +58,18 @@ from risk_engine import check
 from data_fusion_engine import build_token_profile
 from scorer import score_pair
 from simulator import simulate
-from smart_wallet_tracker import analyze as smart_money
-from pattern_detector import detect_pattern
-from decision_engine import decide
+
+from smart_wallet_tracker import (
+    analyze as smart_money,
+)
+
+from pattern_detector import (
+    detect_pattern,
+)
+
+from decision_engine import (
+    decide,
+)
 
 from learning_engine import (
     create_learning_table,
@@ -62,38 +78,16 @@ from learning_engine import (
 
 
 # ============================================================
-# SAFETY MODULES
+# OPTIONAL NETWORK GUARD
 # ============================================================
 
 try:
+
     from network_guard import check_all
+
 except ImportError:
+
     check_all = None
-
-
-try:
-    from safe_mode import (
-        enter_safe_mode,
-        exit_safe_mode,
-        is_safe_mode,
-    )
-except ImportError:
-
-    def enter_safe_mode(reason, error=None):
-        logging.warning(
-            "SAFE MODE: %s | %s",
-            reason,
-            error,
-        )
-
-    def exit_safe_mode(reason="recovered"):
-        logging.info(
-            "NORMAL MODE: %s",
-            reason,
-        )
-
-    def is_safe_mode():
-        return False
 
 
 # ============================================================
@@ -117,30 +111,32 @@ ERROR_RETRY_INTERVAL = float(
 MAX_PAIRS_PER_CYCLE = int(
     os.getenv(
         "MAX_PAIRS_PER_CYCLE",
-        "100",
+        "250",
     )
 )
 
-MAX_RESULTS_PRINTED = int(
+MAX_DAILY_TRADES = int(
     os.getenv(
-        "MAX_RESULTS_PRINTED",
-        "10",
+        "MAX_DAILY_TRADES",
+        "50",
     )
 )
 
-# Safety default.
-# Do not enable live execution from this file.
+MIN_SCORE = float(
+    os.getenv(
+        "MIN_SCORE",
+        "45",
+    )
+)
+
 RUN_MODE = os.getenv(
     "RUN_MODE",
     "paper",
 ).lower()
 
-MIN_SCORE = float(
-    os.getenv(
-        "MIN_SCORE",
-        "70",
-    )
-)
+STATE_FILE = "state.json"
+
+LOG_FILE = "ghost_engine.log"
 
 
 # ============================================================
@@ -148,7 +144,7 @@ MIN_SCORE = float(
 # ============================================================
 
 logging.basicConfig(
-    filename="ghost_engine.log",
+    filename=LOG_FILE,
     level=logging.INFO,
     format=(
         "%(asctime)s | "
@@ -166,26 +162,28 @@ logger = logging.getLogger(
 # STATE
 # ============================================================
 
-STATE_FILE = "state.json"
+def default_state() -> Dict[str, Any]:
+
+    return {
+        "date": str(date.today()),
+        "daily_trades": 0,
+        "scan_count": 0,
+        "errors": 0,
+        "last_scan": 0,
+        "last_successful_scan": 0,
+        "last_error": None,
+    }
 
 
 def load_state() -> Dict[str, Any]:
 
-    default_state = {
-        "safe_mode": True,
-        "reason": "startup",
-        "last_scan": 0,
-        "last_successful_scan": 0,
-        "last_heartbeat": 0,
-        "scan_count": 0,
-        "errors": 0,
-        "last_error": None,
-    }
+    state = default_state()
 
     if not os.path.exists(
         STATE_FILE
     ):
-        return default_state
+
+        return state
 
     try:
 
@@ -195,44 +193,45 @@ def load_state() -> Dict[str, Any]:
             encoding="utf-8",
         ) as file:
 
-            data = json.load(file)
+            loaded = json.load(
+                file
+            )
 
-        if not isinstance(
-            data,
+        if isinstance(
+            loaded,
             dict,
         ):
-            return default_state
 
-        default_state.update(
-            data
-        )
+            state.update(
+                loaded
+            )
 
-        return default_state
-
-    except (
-        OSError,
-        json.JSONDecodeError,
-    ) as error:
+    except Exception as error:
 
         logger.error(
             "STATE LOAD ERROR: %s",
             error,
         )
 
-        return default_state
+    # New day.
+    today = str(
+        date.today()
+    )
+
+    if state.get(
+        "date"
+    ) != today:
+
+        state = default_state()
+
+    return state
 
 
 def save_state(
-    updates: Dict[str, Any],
+    state: Dict[str, Any],
 ) -> None:
 
-    state = load_state()
-
-    state.update(
-        updates
-    )
-
-    temporary_file = (
+    temporary = (
         STATE_FILE
         + ".tmp"
     )
@@ -240,7 +239,7 @@ def save_state(
     try:
 
         with open(
-            temporary_file,
+            temporary,
             "w",
             encoding="utf-8",
         ) as file:
@@ -252,16 +251,13 @@ def save_state(
             )
 
             file.flush()
-            os.fsync(
-                file.fileno()
-            )
 
         os.replace(
-            temporary_file,
+            temporary,
             STATE_FILE,
         )
 
-    except OSError as error:
+    except Exception as error:
 
         logger.error(
             "STATE SAVE ERROR: %s",
@@ -270,132 +266,14 @@ def save_state(
 
 
 # ============================================================
-# HEARTBEAT
+# HELPERS
 # ============================================================
 
-def heartbeat() -> None:
-
-    save_state(
-        {
-            "last_heartbeat": time.time(),
-        }
-    )
-
-
-# ============================================================
-# DATA VALIDATION
-# ============================================================
-
-def valid_pair(
-    pair: Any,
-) -> bool:
-
-    if not isinstance(
-        pair,
-        dict,
-    ):
-        return False
-
-    base_token = pair.get(
-        "baseToken"
-    )
-
-    if not isinstance(
-        base_token,
-        dict,
-    ):
-        return False
-
-    address = base_token.get(
-        "address"
-    )
-
-    symbol = base_token.get(
-        "symbol"
-    )
-
-    if not address:
-        return False
-
-    if not symbol:
-        return False
-
-    return True
-
-
-def normalize_number(
-    value: Any,
-    default: float = 0.0,
-) -> float:
-
-    try:
-
-        if value is None:
-            return default
-
-        return float(
-            value
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        return default
-
-
-# ============================================================
-# NETWORK HEALTH
-# ============================================================
-
-def network_is_healthy() -> bool:
-
-    if check_all is None:
-
-        logger.warning(
-            "network_guard.py not available"
-        )
-
-        # We do not blindly trade without the guard.
-        return False
-
-    try:
-
-        health = check_all()
-
-        if not isinstance(
-            health,
-            dict,
-        ):
-            return False
-
-        return bool(
-            health.get(
-                "healthy",
-                False,
-            )
-        )
-
-    except Exception as error:
-
-        logger.error(
-            "NETWORK CHECK ERROR: %s",
-            error,
-        )
-
-        return False
-
-
-# ============================================================
-# SAFE MODULE CALL
-# ============================================================
-
-def call_module(
+def safe_call(
     func,
     *args,
     default=None,
-    module_name="module",
+    name="module",
 ):
 
     try:
@@ -408,16 +286,31 @@ def call_module(
 
         logger.exception(
             "%s ERROR: %s",
-            module_name,
+            name,
             error,
         )
 
         return default
 
 
-# ============================================================
-# SCORE EXTRACTION
-# ============================================================
+def get_number(
+    value: Any,
+    default: float = 0,
+) -> float:
+
+    try:
+
+        return float(
+            value
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return default
+
 
 def extract_score(
     value: Any,
@@ -445,79 +338,115 @@ def extract_score(
 
             if key in value:
 
-                try:
-
-                    return float(
-                        value[key]
-                    )
-
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    pass
+                return get_number(
+                    value[key],
+                    None,
+                )
 
     return None
 
 
-# ============================================================
-# DECISION EXTRACTION
-# ============================================================
-
-def decision_is_tradeable(
-    decision: Any,
+def valid_pair(
+    pair: Any,
 ) -> bool:
 
-    if decision is None:
-        return False
-
-    if isinstance(
-        decision,
-        bool,
-    ):
-        return decision
-
-    if isinstance(
-        decision,
+    if not isinstance(
+        pair,
         dict,
     ):
+        return False
 
-        value = decision.get(
-            "approved",
-            decision.get(
-                "trade",
-                False,
-            ),
-        )
+    base = pair.get(
+        "baseToken"
+    )
 
-        return bool(
-            value
-        )
-
-    if isinstance(
-        decision,
-        str,
+    if not isinstance(
+        base,
+        dict,
     ):
+        return False
 
-        normalized = (
-            decision
-            .strip()
-            .lower()
-        )
+    if not base.get(
+        "address"
+    ):
+        return False
 
-        return normalized in {
-            "buy",
-            "approved",
-            "trade",
-            "enter",
-            "execute",
-        }
+    if not base.get(
+        "symbol"
+    ):
+        return False
 
-    return False
+    return True
 
 
 # ============================================================
-# TOKEN ANALYSIS
+# NETWORK
+# ============================================================
+
+def network_ok() -> bool:
+
+    if check_all is None:
+
+        # Do not block the entire scanner if the optional
+        # network guard module is not installed.
+        return True
+
+    try:
+
+        result = check_all()
+
+        if isinstance(
+            result,
+            bool,
+        ):
+
+            return result
+
+        if isinstance(
+            result,
+            dict,
+        ):
+
+            return bool(
+                result.get(
+                    "healthy",
+                    False,
+                )
+            )
+
+        return False
+
+    except Exception as error:
+
+        logger.error(
+            "NETWORK ERROR: %s",
+            error,
+        )
+
+        return False
+
+
+# ============================================================
+# DAILY TRADE LIMIT
+# ============================================================
+
+def trade_limit_reached(
+    state: Dict[str, Any],
+) -> bool:
+
+    return (
+        int(
+            state.get(
+                "daily_trades",
+                0,
+            )
+        )
+        >= MAX_DAILY_TRADES
+    )
+
+
+# ============================================================
+# ANALYZE TOKEN
 # ============================================================
 
 def analyze_token(
@@ -530,56 +459,43 @@ def analyze_token(
 
         return None
 
-    symbol = (
-        pair
-        .get("baseToken", {})
-        .get("symbol", "UNKNOWN")
+    base = pair[
+        "baseToken"
+    ]
+
+    symbol = base.get(
+        "symbol",
+        "UNKNOWN",
     )
 
-    address = (
-        pair
-        .get("baseToken", {})
-        .get("address")
+    address = base.get(
+        "address"
     )
 
     # --------------------------------------------------------
-    # 1. BASIC RISK
+    # RISK
     # --------------------------------------------------------
 
-    try:
+    risk = safe_call(
+        check,
+        pair,
+        default=False,
+        name="risk_engine",
+    )
 
-        risk_result = check(
-            pair
-        )
-
-        if not risk_result:
-
-            logger.info(
-                "REJECTED BY RISK: %s",
-                symbol,
-            )
-
-            return None
-
-    except Exception as error:
-
-        logger.error(
-            "RISK ERROR %s: %s",
-            symbol,
-            error,
-        )
+    if not risk:
 
         return None
 
     # --------------------------------------------------------
-    # 2. DATA FUSION
+    # DATA FUSION
     # --------------------------------------------------------
 
-    profile = call_module(
+    profile = safe_call(
         build_token_profile,
         pair,
         default=None,
-        module_name="data_fusion",
+        name="data_fusion",
     )
 
     if not isinstance(
@@ -590,42 +506,42 @@ def analyze_token(
         return None
 
     # --------------------------------------------------------
-    # 3. SMART MONEY
+    # SMART MONEY
     # --------------------------------------------------------
 
-    smart = call_module(
+    smart = safe_call(
         smart_money,
         pair,
         default=0,
-        module_name="smart_money",
+        name="smart_money",
     )
 
     if smart is None:
         smart = 0
 
     # --------------------------------------------------------
-    # 4. PATTERN
+    # PATTERN
     # --------------------------------------------------------
 
-    pattern = call_module(
+    pattern = safe_call(
         detect_pattern,
         pair,
         default=0,
-        module_name="pattern_detector",
+        name="pattern_detector",
     )
 
     if pattern is None:
         pattern = 0
 
     # --------------------------------------------------------
-    # 5. SCORING
+    # SCORE
     # --------------------------------------------------------
 
-    raw_score = call_module(
+    raw_score = safe_call(
         score_pair,
         pair,
         default=None,
-        module_name="scorer",
+        name="scorer",
     )
 
     score = extract_score(
@@ -634,36 +550,23 @@ def analyze_token(
 
     if score is None:
 
-        logger.warning(
-            "INVALID SCORE: %s",
-            symbol,
-        )
-
         return None
 
-    # --------------------------------------------------------
-    # 6. SCORE GATE
-    # --------------------------------------------------------
-
+    # A low base score can still be monitored,
+    # but it won't be treated as a trade candidate.
     if score < MIN_SCORE:
 
-        logger.info(
-            "LOW SCORE: %s = %.2f",
-            symbol,
-            score,
-        )
-
         return None
 
     # --------------------------------------------------------
-    # 7. SIMULATION
+    # SIMULATION
     # --------------------------------------------------------
 
-    simulation = call_module(
+    simulation = safe_call(
         simulate,
         pair,
         default=None,
-        module_name="simulator",
+        name="simulator",
     )
 
     if simulation is None:
@@ -671,65 +574,50 @@ def analyze_token(
         return None
 
     # --------------------------------------------------------
-    # 8. DECISION
+    # DECISION
     # --------------------------------------------------------
 
-    try:
+    decision = safe_call(
+        decide,
+        score,
+        risk,
+        simulation,
+        smart,
+        pattern,
+        default=None,
+        name="decision_engine",
+    )
 
-        decision = decide(
-            score,
-            risk_result,
-            simulation,
-            smart,
-            pattern,
-        )
-
-    except Exception as error:
-
-        logger.error(
-            "DECISION ERROR %s: %s",
-            symbol,
-            error,
-        )
+    if not isinstance(
+        decision,
+        dict,
+    ):
 
         return None
 
-    # --------------------------------------------------------
-    # 9. FINAL RESULT
-    # --------------------------------------------------------
-
-    result = {
-        "symbol": (
-            profile.get(
-                "symbol",
-                symbol,
-            )
+    return {
+        "symbol": profile.get(
+            "symbol",
+            symbol,
         ),
-        "address": (
-            profile.get(
-                "address",
-                address,
-            )
+        "address": profile.get(
+            "address",
+            address,
         ),
         "score": score,
         "smart_money": smart,
         "pattern": pattern,
         "simulation": simulation,
         "decision": decision,
-        "tradeable": decision_is_tradeable(
-            decision
-        ),
         "timestamp": time.time(),
     }
 
-    return result
-
 
 # ============================================================
-# SAVE LEARNING DATA
+# LEARNING
 # ============================================================
 
-def save_learning_result(
+def learn(
     result: Dict[str, Any],
 ) -> None:
 
@@ -744,110 +632,91 @@ def save_learning_result(
     except Exception as error:
 
         logger.error(
-            "LEARNING SAVE ERROR: %s",
+            "LEARNING ERROR: %s",
             error,
         )
 
 
 # ============================================================
-# PRINT OPPORTUNITIES
+# EXECUTION HOOK
 # ============================================================
 
-def print_opportunities(
-    opportunities: List[
-        Dict[str, Any]
-    ],
-) -> None:
+def execute_trade(
+    result: Dict[str, Any],
+) -> bool:
 
-    print(
-        "\n"
-        + "=" * 70
+    """
+    This is intentionally an execution hook.
+
+    Do NOT put a fake swap here.
+
+    Connect this function to trade_manager.py once
+    live execution has been tested independently.
+    """
+
+    decision = result.get(
+        "decision",
+        {},
     )
 
-    print(
-        f"Qualified candidates: "
-        f"{len(opportunities)}"
-    )
+    if not decision.get(
+        "trade",
+        False,
+    ):
 
-    print(
-        "=" * 70
-    )
+        return False
 
-    for item in opportunities[
-        :MAX_RESULTS_PRINTED
-    ]:
+    if RUN_MODE != "live":
 
-        print(
-            "\nTOKEN:",
-            item["symbol"],
+        logger.info(
+            "PAPER TRADE: %s | %s",
+            result["symbol"],
+            decision,
         )
 
         print(
-            "ADDRESS:",
-            item["address"],
-        )
-
-        print(
-            "SCORE:",
-            round(
-                item["score"],
-                2,
-            ),
-        )
-
-        print(
-            "SMART MONEY:",
-            item["smart_money"],
-        )
-
-        print(
-            "PATTERN:",
-            item["pattern"],
-        )
-
-        print(
-            "SIMULATION:",
-            item["simulation"],
-        )
-
-        print(
-            "DECISION:",
-            item["decision"],
-        )
-
-        print(
-            "TRADEABLE:",
-            item["tradeable"],
-        )
-
-
-# ============================================================
-# ONE SCAN CYCLE
-# ============================================================
-
-def scan_cycle() -> bool:
-
-    heartbeat()
-
-    # --------------------------------------------------------
-    # NETWORK
-    # --------------------------------------------------------
-
-    if not network_is_healthy():
-
-        enter_safe_mode(
-            "network_or_api_health_failure"
-        )
-
-        print(
-            "[SAFE MODE] "
-            "Network/API health failed."
+            f"[PAPER] "
+            f"{result['symbol']} | "
+            f"{decision.get('level')} | "
+            f"score={decision.get('score')}"
         )
 
         return False
 
+    # Live mode intentionally does not execute automatically
+    # until trade_manager.py is connected.
+    logger.warning(
+        "LIVE opportunity detected but "
+        "execution manager is not connected: %s",
+        result["symbol"],
+    )
+
+    return False
+
+
+# ============================================================
+# ONE CYCLE
+# ============================================================
+
+def run_cycle(
+    state: Dict[str, Any],
+) -> None:
+
+    if not network_ok():
+
+        logger.warning(
+            "Network/API unavailable. "
+            "Skipping cycle."
+        )
+
+        print(
+            "[NETWORK] unavailable"
+        )
+
+        return
+
     # --------------------------------------------------------
-    # SCANNER
+    # SCAN
     # --------------------------------------------------------
 
     pairs = fetch_pairs()
@@ -858,53 +727,52 @@ def scan_cycle() -> bool:
     ):
 
         raise ValueError(
-            "scanner.fetch_pairs() "
-            "must return a list"
+            "fetch_pairs() "
+            "must return list"
         )
 
     if not pairs:
 
-        logger.info(
-            "Scanner returned no pairs."
+        print(
+            "[SCAN] no pairs"
         )
 
-        return True
+        return
 
     # --------------------------------------------------------
-    # FILTERS
+    # FILTER
     # --------------------------------------------------------
 
-    filtered = filter_pairs(
+    pairs = filter_pairs(
         pairs
     )
 
     if not isinstance(
-        filtered,
+        pairs,
         list,
     ):
 
         raise ValueError(
             "filter_pairs() "
-            "must return a list"
+            "must return list"
         )
 
-    # Prevent accidental huge cycles.
-    filtered = filtered[
+    pairs = pairs[
         :MAX_PAIRS_PER_CYCLE
     ]
 
-    opportunities = []
+    print(
+        f"[SCAN] "
+        f"{len(pairs)} candidates"
+    )
 
     # --------------------------------------------------------
-    # ANALYSIS
+    # ANALYZE
     # --------------------------------------------------------
 
-    for pair in filtered:
+    results = []
 
-        if not valid_pair(
-            pair
-        ):
-            continue
+    for pair in pairs:
 
         result = analyze_token(
             pair
@@ -913,11 +781,11 @@ def scan_cycle() -> bool:
         if result is None:
             continue
 
-        opportunities.append(
+        results.append(
             result
         )
 
-        save_learning_result(
+        learn(
             result
         )
 
@@ -925,8 +793,9 @@ def scan_cycle() -> bool:
     # RANK
     # --------------------------------------------------------
 
-    opportunities.sort(
-        key=lambda item: normalize_number(
+    results.sort(
+        key=lambda item:
+        get_number(
             item.get(
                 "score",
                 0,
@@ -935,47 +804,125 @@ def scan_cycle() -> bool:
         reverse=True,
     )
 
-    print_opportunities(
-        opportunities
+    # --------------------------------------------------------
+    # DISPLAY
+    # --------------------------------------------------------
+
+    print(
+        "\n"
+        + "-" * 70
+    )
+
+    print(
+        f"Qualified: "
+        f"{len(results)}"
+    )
+
+    for item in results[
+        :20
+    ]:
+
+        decision = item[
+            "decision"
+        ]
+
+        print(
+            f"{item['symbol']:15} "
+            f"score={item['score']:6.2f} "
+            f"level={decision.get('level')} "
+            f"action={decision.get('action')}"
+        )
+
+    # --------------------------------------------------------
+    # EXECUTION CANDIDATES
+    # --------------------------------------------------------
+
+    if trade_limit_reached(
+        state
+    ):
+
+        print(
+            "[LIMIT] "
+            f"{MAX_DAILY_TRADES} daily "
+            "trade limit reached."
+        )
+
+        return
+
+    candidates = [
+        item
+        for item in results
+        if item[
+            "decision"
+        ].get(
+            "trade",
+            False,
+        )
+    ]
+
+    # Highest quality first.
+    candidates.sort(
+        key=lambda item:
+        get_number(
+            item[
+                "decision"
+            ].get(
+                "score",
+                item["score"],
+            )
+        ),
+        reverse=True,
     )
 
     # --------------------------------------------------------
-    # SUCCESS
+    # EXECUTE
     # --------------------------------------------------------
 
-    now = time.time()
+    for result in candidates:
 
-    state = load_state()
+        if trade_limit_reached(
+            state
+        ):
+
+            break
+
+        executed = execute_trade(
+            result
+        )
+
+        if executed:
+
+            state[
+                "daily_trades"
+            ] += 1
+
+            save_state(
+                state
+            )
+
+    # --------------------------------------------------------
+    # STATE
+    # --------------------------------------------------------
+
+    state[
+        "last_scan"
+    ] = time.time()
+
+    state[
+        "last_successful_scan"
+    ] = time.time()
+
+    state[
+        "scan_count"
+    ] += 1
 
     save_state(
-        {
-            "safe_mode": False,
-            "reason": "healthy_scan",
-            "last_scan": now,
-            "last_successful_scan": now,
-            "last_heartbeat": now,
-            "scan_count": (
-                int(
-                    state.get(
-                        "scan_count",
-                        0,
-                    )
-                )
-                + 1
-            ),
-            "last_error": None,
-        }
+        state
     )
-
-    exit_safe_mode(
-        "healthy_scan"
-    )
-
-    return True
 
 
 # ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
 def main():
@@ -986,29 +933,29 @@ def main():
     )
 
     print(
-        "Starting..."
+        "Continuous scanner"
     )
 
     print(
-        f"Mode: {RUN_MODE.upper()}"
+        f"Mode: {RUN_MODE}"
     )
 
     print(
-        f"Scan interval: "
-        f"{SCAN_INTERVAL}s"
+        f"Interval: {SCAN_INTERVAL}s"
     )
 
     print(
-        f"Minimum score: "
-        f"{MIN_SCORE}"
+        f"Daily max trades: "
+        f"{MAX_DAILY_TRADES}"
     )
 
     print(
-        "Safety: ENABLED"
+        f"Pairs/cycle: "
+        f"{MAX_PAIRS_PER_CYCLE}"
     )
 
     # --------------------------------------------------------
-    # LEARNING DATABASE
+    # LEARNING DB
     # --------------------------------------------------------
 
     try:
@@ -1018,47 +965,44 @@ def main():
     except Exception as error:
 
         logger.exception(
-            "LEARNING DATABASE INIT ERROR"
+            "Learning DB initialization failed"
         )
 
-        enter_safe_mode(
-            "learning_database_initialization_failed",
-            error,
+        print(
+            "[ERROR] learning database"
         )
 
-        # Do not continue blindly.
         return
 
     # --------------------------------------------------------
-    # START SAFE
+    # LOOP
     # --------------------------------------------------------
-
-    enter_safe_mode(
-        "startup_validation"
-    )
 
     while True:
 
-        started_at = time.time()
+        started = time.time()
+
+        state = load_state()
+
+        print(
+            "\n"
+            f"[{datetime.now().strftime('%H:%M:%S')}] "
+            f"Scanning | "
+            f"daily trades="
+            f"{state['daily_trades']}/"
+            f"{MAX_DAILY_TRADES}"
+        )
 
         try:
 
-            print(
-                "\n"
-                f"[{datetime.now().isoformat()}]"
-                " scanning..."
+            run_cycle(
+                state
             )
-
-            scan_cycle()
 
         except KeyboardInterrupt:
 
             print(
-                "\nGhost Engine stopped."
-            )
-
-            enter_safe_mode(
-                "manual_shutdown"
+                "\nStopped."
             )
 
             break
@@ -1070,37 +1014,23 @@ def main():
                 error,
             )
 
-            state = load_state()
+            state[
+                "errors"
+            ] += 1
 
-            save_state(
-                {
-                    "safe_mode": True,
-                    "reason": "main_loop_exception",
-                    "errors": (
-                        int(
-                            state.get(
-                                "errors",
-                                0,
-                            )
-                        )
-                        + 1
-                    ),
-                    "last_error": str(
-                        error
-                    ),
-                    "last_heartbeat": time.time(),
-                }
+            state[
+                "last_error"
+            ] = str(
+                error
             )
 
-            enter_safe_mode(
-                "main_loop_exception",
-                error,
+            save_state(
+                state
             )
 
             print(
-                "[SAFE MODE] "
-                "Cycle failed. "
-                "No trade."
+                "[ERROR] "
+                "cycle failed; retrying."
             )
 
             time.sleep(
@@ -1109,24 +1039,28 @@ def main():
 
             continue
 
+        # ----------------------------------------------------
+        # MAINTAIN 3-SECOND CYCLE
+        # ----------------------------------------------------
+
         elapsed = (
             time.time()
-            - started_at
+            - started
         )
 
-        sleep_time = max(
+        sleep_for = max(
             0.5,
             SCAN_INTERVAL
             - elapsed,
         )
 
         time.sleep(
-            sleep_time
+            sleep_for
         )
 
 
 # ============================================================
-# ENTRY POINT
+# ENTRY
 # ============================================================
 
 if __name__ == "__main__":
