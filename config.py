@@ -1,12 +1,11 @@
 import os
-
 from dotenv import load_dotenv
 
 load_dotenv()
 
 RPC_URL = os.getenv(
     "RPC_URL",
-    "https://api.mainnet-beta.solana.com",
+    "https://api.mainnet-beta.solana.com"
 )
 
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
